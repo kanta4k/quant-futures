@@ -16,7 +16,16 @@ export async function api<T = unknown>(path: string, init?: RequestInit & { json
     cache: "no-store",
   });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // 백엔드가 꺼져 있으면 Next.js 프록시가 JSON 대신 "Internal Server Error" 텍스트를 돌려준다
+    throw new ApiError(
+      res.status,
+      res.status >= 500 ? `백엔드 서버에 연결할 수 없습니다 (HTTP ${res.status}). 서버 실행 여부를 확인하세요.` : `잘못된 응답 (HTTP ${res.status})`,
+    );
+  }
   if (!res.ok) {
     const detail = data?.detail;
     const msg = Array.isArray(detail) ? detail.map((d) => (typeof d === "string" ? d : d.msg)).join("; ") : detail;
