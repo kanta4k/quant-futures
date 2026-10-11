@@ -85,7 +85,7 @@ export default function OverviewPage() {
                         {r.id}
                       </Link>
                     </td>
-                    <td>{r.symbol}</td>
+                    <td title={r.symbol}>{r.symbol.includes(",") ? `${r.symbol.split(",").length}종목` : r.symbol}</td>
                     <td className={`text-right ${r.metrics.return_pct >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
                       {fmt(r.metrics.return_pct)}%
                     </td>

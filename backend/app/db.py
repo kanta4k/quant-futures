@@ -41,7 +41,7 @@ class BacktestRun(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     strategy: Mapped[str] = mapped_column(String(64))
     strategy_version: Mapped[str] = mapped_column(String(16))
-    symbol: Mapped[str] = mapped_column(String(32))
+    symbol: Mapped[str] = mapped_column(String(400))  # 쉼표로 구분한 종목 목록
     interval: Mapped[str] = mapped_column(String(8))
     request: Mapped[dict] = mapped_column(JSON)
     metrics: Mapped[dict] = mapped_column(JSON)

@@ -1,16 +1,16 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.risk import current_version
-from app.backtest.engine import CostModel, run_backtest
-from app.core.risk import RiskSettings
+from app.backtest import service
+from app.backtest.service import BacktestRequest, OptimizeRequest, Prepared
 from app.data import binance_public as market
 from app.db import BacktestRun, get_session
-from app.strategies import REGISTRY, get_strategy
+from app.strategies import REGISTRY
 
 router = APIRouter(prefix="/api", tags=["backtest"])
 
@@ -59,59 +59,41 @@ def download(body: DownloadIn):
         raise HTTPException(502, f"수집 실패: {type(e).__name__}: {e}") from None
 
 
-class BacktestIn(BaseModel):
-    strategy: str = "bb_ema_volume"
-    symbol: str = "BTCUSDT"
-    interval: str = "1h"
-    params: dict = Field(default_factory=dict)
-    risk: dict | None = None  # 없으면 현재 리스크 설정 버전 사용
-    cost: CostModel = Field(default_factory=CostModel)
-    initial_equity: float = Field(500.0, gt=0)
-    apply_loss_limits: bool = True  # 일일 손실·누적 낙폭 잠금 적용 여부
-    start: datetime | None = None
-    end: datetime | None = None
+def _prepare(req: BacktestRequest, session: Session) -> Prepared:
+    try:
+        return Prepared(req, current_version(session).values)
+    except (KeyError, ValidationError, ValueError) as e:
+        raise HTTPException(422, str(e)) from None
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e)) from None
 
 
 @router.post("/backtests")
-def create_backtest(body: BacktestIn, session: Session = Depends(get_session)):
+def create_backtest(body: BacktestRequest, session: Session = Depends(get_session)):
+    prep = _prepare(body, session)
     try:
-        cls = get_strategy(body.strategy)
-        strategy = cls(cls.Params(**body.params))
-        risk = RiskSettings(**(body.risk or current_version(session).values))
-    except (KeyError, ValidationError) as e:
-        raise HTTPException(422, str(e)) from None
-    try:
-        df = market.load_dataset(body.symbol, body.interval)
-    except FileNotFoundError as e:
-        raise HTTPException(404, str(e)) from None
-    if body.start is not None:
-        df = df[df["open_time"] >= body.start]
-    if body.end is not None:
-        df = df[df["open_time"] <= body.end]
-    if len(df) <= strategy.warmup_bars():
-        raise HTTPException(400, f"봉 수 부족: {len(df)} (준비 봉 {strategy.warmup_bars()} 필요)")
-
-    result = run_backtest(
-        df, strategy, risk, body.cost, body.initial_equity, body.apply_loss_limits
-    )
-    out = result.to_dict()
+        out = service.run_request(prep)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
     run = BacktestRun(
-        strategy=cls.name,
-        strategy_version=cls.version,
-        symbol=body.symbol.upper(),
+        strategy=prep.strategy_cls.name,
+        strategy_version=prep.strategy_cls.version,
+        symbol=",".join(body.symbols),
         interval=body.interval,
         request={
             **body.model_dump(mode="json"),
-            "params": strategy.params.model_dump(),
-            "risk": risk.model_dump(),
-            "bars": len(df),
+            "params": prep.strategy.params.model_dump(),
+            "risk": prep.risk.model_dump(),
         },
-        metrics=out["metrics"],
+        metrics={
+            **out["metrics"],
+            "segments": {k: v["metrics"] for k, v in out["segments"].items()},
+        },
         result=out,
     )
     session.add(run)
     session.commit()
-    return {"id": run.id, **out}
+    return {"id": run.id, "request": run.request, **out}
 
 
 @router.get("/backtests")
@@ -136,4 +118,23 @@ def get_backtest(run_id: int, session: Session = Depends(get_session)):
     r = session.get(BacktestRun, run_id)
     if r is None:
         raise HTTPException(404, "백테스트 없음")
-    return {"id": r.id, "request": r.request, **r.result}
+    return {"id": r.id, "request": r.request, "segments": {}, **r.result}
+
+
+@router.post("/optimize")
+def start_optimize(body: OptimizeRequest, session: Session = Depends(get_session)):
+    try:
+        job = service.start_optimize(body, current_version(session).values)
+    except (KeyError, ValidationError, ValueError) as e:
+        raise HTTPException(422, str(e)) from None
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e)) from None
+    return job.view(body.objective, body.min_trades)
+
+
+@router.get("/optimize/{job_id}")
+def get_optimize(job_id: str):
+    if job_id not in service.JOBS:
+        raise HTTPException(404, "탐색 작업 없음 (서버 재시작 시 사라집니다)")
+    job, req = service.JOBS[job_id]
+    return job.view(req.objective, req.min_trades)
